@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { METERS, accentOf, alignedOffset, beatFrames, beatInfo, clampBpm, cycleAt, loopFrames, loopPos, recordWindow, syncedDelay, tapTempo } from "../src/core/timing.ts";
-import { decideCycle, simulate } from "../src/core/plan.ts";
+import { barLength, countdown, lcmBars, nextCycleStart, phaseOf, trackPos } from "../src/core/grid.ts";
 import { FrameRing } from "../src/core/ring.ts";
 import { closeLoop, maxStep, reverse } from "../src/core/seam.ts";
 import { detectLatency } from "../src/core/latency.ts";
@@ -55,26 +55,40 @@ test("accents, clamp, tap tempo, synced delay", () => {
   assert.equal(syncedDelay(120, "1/8."), 0.375);
 });
 
-test("planner: record each cycle without gap", () => {
-  const a = simulate(3, 0, 5).map((x) => (x.kind === "record" ? `R${x.track}` : x.kind));
-  assert.deepEqual(a, ["R0", "R1", "R2", "play", "play"]);
+test("grid: whole-frame bars, next loop start, minimum lead", () => {
+  assert.equal(barLength(120, 4, 48000), 96000);
+  assert.equal(barLength(97, 4, 44100), Math.round((44100 * 60 * 4) / 97));
+  const t0 = 5000, M = 4 * 96000;
+  // REC pressed in the middle of cycle 2 -> starts exactly at the start of cycle 3
+  assert.equal(nextCycleStart(t0 + 2 * M + 123456, t0, M), t0 + 3 * M);
+  // exactly on a start counts as that start; too close (inside the lead) waits for the next
+  assert.equal(nextCycleStart(t0 + 3 * M, t0, M), t0 + 3 * M);
+  assert.equal(nextCycleStart(t0 + 3 * M - 100, t0, M, 2880), t0 + 4 * M);
+  // during count-in (before t0) the first start is t0
+  assert.equal(nextCycleStart(t0 - 90000, t0, M), t0);
 });
 
-test("planner: one free cycle between recordings", () => {
-  const a = simulate(3, 1, 7).map((x) => (x.kind === "record" ? `R${x.track}` : x.kind));
-  assert.deepEqual(a, ["R0", "listen", "R1", "listen", "R2", "play", "play"]);
+test("grid: per-track lengths stay phase-locked", () => {
+  const bar = 96000, t0 = 1000, M = 4 * bar;
+  // an 8-bar track recorded from cycle 3 (odd cycle) has phase 4 bars
+  const L8 = 8 * bar;
+  const S = t0 + 3 * M;
+  assert.equal(phaseOf(S, t0, L8), 4 * bar);
+  // its loop restarts exactly on every second master cycle after S, forever
+  for (const k of [0, 2, 4, 1000]) assert.equal(trackPos(S + k * M, t0, 4 * bar, L8), 0);
+  assert.equal(trackPos(S + M, t0, 4 * bar, L8), M);
+  // a 1-bar track restarts on every bar line of the master
+  for (let k = 0; k < 9; k++) assert.equal(trackPos(t0 + k * bar, t0, phaseOf(t0 + 2 * M, t0, bar), bar), 0);
 });
 
-test("planner: re-record, deleted slot and auto-record off", () => {
-  const slots = [
-    { hasAudio: true, rerecord: false },
-    { hasAudio: true, rerecord: true },
-    { hasAudio: false, rerecord: false },
-  ];
-  assert.deepEqual(decideCycle({ slots, trackCount: 3, gap: 0, autoRecord: true, cyclesSinceRecord: Infinity }), { kind: "record", track: 1 });
-  assert.deepEqual(decideCycle({ slots, trackCount: 3, gap: 0, autoRecord: false, cyclesSinceRecord: Infinity }), { kind: "play" });
-  assert.deepEqual(decideCycle({ slots, trackCount: 1, gap: 0, autoRecord: true, cyclesSinceRecord: Infinity }), { kind: "play" });
-  assert.deepEqual(decideCycle({ slots, trackCount: 3, gap: 2, autoRecord: true, cyclesSinceRecord: 0 }), { kind: "listen", nextRecordIn: 2, track: 1 });
+test("grid: LCM of track lengths for export and countdown display", () => {
+  assert.equal(lcmBars([4, 8, 1]), 8);
+  assert.equal(lcmBars([3, 4]), 12);
+  assert.equal(lcmBars([16, 5, 7]), 16); // 560 bars > cap -> longest track
+  const bar = 4800 * 4; // 4 beats of 4800
+  assert.deepEqual(countdown(0, 3 * bar, bar, 4), { bars: 3, beats: 12, show: 3, unit: "Takte" });
+  assert.deepEqual(countdown(2 * bar + 1, 3 * bar, bar, 4), { bars: 1, beats: 4, show: 4, unit: "Schläge" });
+  assert.deepEqual(countdown(3 * bar - 10, 3 * bar, bar, 4), { bars: 1, beats: 1, show: 1, unit: "Schlag" });
 });
 
 test("ring buffer keeps absolute frame stamps, handles gaps and wrap", () => {

@@ -1,12 +1,12 @@
 import "./style.css";
-import { Engine, defaultSettings, type ClickMode, type PedalB, type Settings } from "./audio/engine.ts";
+import { BAR_CHOICES, Engine, defaultSettings, type ClickMode, type PedalB, type Settings } from "./audio/engine.ts";
 import { METERS, clampBpm, tapTempo } from "./core/timing.ts";
 import { encodeWav } from "./core/wav.ts";
 import { loadSession, saveSession } from "./core/store.ts";
 import { knob, type Knob } from "./ui/knob.ts";
 import type { DelayDiv, TrackParams } from "./audio/fx.ts";
 
-const LS = "loopstep:settings:v1";
+const LS = "loopstep:settings:v2";
 const saved = (() => {
   try {
     return JSON.parse(localStorage.getItem(LS) ?? "{}") as Partial<Settings> & { pedal?: boolean; hideHint?: boolean };
@@ -58,7 +58,9 @@ function select<T extends string | number>(label: string, opts: [T, string][], v
 const app = document.getElementById("app")!;
 const stateBig = h("div", { class: "state", "data-testid": "state" }, "Bereit");
 const stateSub = h("div", { class: "state-sub", "data-testid": "state-sub" }, "");
-const countBig = h("div", { class: "count", "data-testid": "count" }, "");
+const countNum = h("div", { class: "count", "data-testid": "count" }, "");
+const countUnit = h("div", { class: "count-unit", "data-testid": "count-unit" }, "");
+const countBig = h("div", { class: "count-box" }, countNum, countUnit);
 const barNum = h("div", { class: "barnum", "data-testid": "bar" }, "–");
 const beatDots = h("div", { class: "dots", "aria-hidden": "true" });
 const progress = h("div", { class: "progress" }, h("div", { class: "progress-fill" }));
@@ -75,11 +77,11 @@ const display = h(
 
 const mainBtn = btn("Start", "main-btn", () => void main(), "main");
 const undoBtn = btn("↶ Rückgängig", "wood-btn", () => engine.undo(), "undo");
-const autoBtn = btn("Auto-Aufnahme: an", "wood-btn", () => engine.setAutoRecord(!engine.autoRecord), "auto");
+const nextBtn = btn("● REC nächste Spur", "wood-btn rec-next", () => void guard(() => engine.pedalTap()), "rec-next");
 const clearBtn = btn("Alles löschen", "wood-btn danger", () => {
   if (confirm("Alle Spuren löschen?")) engine.clearAll();
 }, "clear");
-const transport = h("section", { class: "transport" }, mainBtn, h("div", { class: "transport-row" }, undoBtn, autoBtn, clearBtn));
+const transport = h("section", { class: "transport" }, mainBtn, h("div", { class: "transport-row" }, undoBtn, nextBtn, clearBtn));
 
 const hint = h(
   "div",
@@ -116,12 +118,16 @@ const tapBtn = btn("Tap", "wood-btn sq", () => {
 }, "tap");
 const bpmRow = h("div", { class: "field bpm-field" }, h("span", { class: "engrave" }, "Tempo (BPM)"), h("div", { class: "bpm-row" }, bpmMinus, bpmVal, bpmPlus, tapBtn));
 const meterSel = select("Taktart", Object.keys(METERS).map((m) => [m, m] as [string, string]), settings.meter, (v) => { settings.meter = v; persist(); refresh(); }, "meter");
-const barsSel = select("Loop-Länge", [1, 2, 4, 8, 16].map((n) => [n, `${n} ${n === 1 ? "Takt" : "Takte"}`] as [number, string]), settings.bars, (v) => { settings.bars = v; persist(); refresh(); }, "bars");
+const defBarsSel = select("Länge neuer Spuren", BAR_CHOICES.map((n) => [n, `${n} ${n === 1 ? "Takt" : "Takte"}`] as [number, string]), settings.defaultBars, (v) => {
+  settings.defaultBars = v;
+  for (const t of engine.tracks) if (!t.data && engine.rec?.track !== t.index) t.bars = v;
+  persist();
+  refresh();
+}, "default-bars");
 const tracksSel = select("Spuren", [1, 2, 3, 4, 5, 6, 7, 8].map((n) => [n, String(n)] as [number, string]), settings.trackCount, (v) => { engine.setTrackCount(v); persist(); }, "tracks");
-const gapSel = select("Zwischenrunde", [[0, "keine"], [1, "1 Runde"], [2, "2 Runden"]] as [number, string][], settings.gap, (v) => { settings.gap = v; persist(); refresh(); }, "gap");
 const countSel = select("Einzählen", [[1, "1 Takt"], [2, "2 Takte"]] as [number, string][], settings.countIn, (v) => { settings.countIn = v; persist(); }, "countin");
 const clickSel = select<ClickMode>("Klick", [["aus", "Aus"], ["einzaehlen", "Nur Einzählen"], ["aufnahme", "Bei Aufnahme"], ["immer", "Immer"]], settings.click, (v) => { settings.click = v; persist(); }, "click");
-const pedalSel = select<PedalB>("Pedal links/hoch", [["undo", "Rückgängig"], ["auto", "Auto-Aufnahme an/aus"], ["stop", "Stopp/Weiter"]], settings.pedalB, (v) => { settings.pedalB = v; persist(); }, "pedalb");
+const pedalSel = select<PedalB>("Pedal links/hoch", [["undo", "Rückgängig"], ["stop", "Stopp/Weiter"], ["cancel", "REC abbrechen"]], settings.pedalB, (v) => { settings.pedalB = v; persist(); }, "pedalb");
 const onsetBtn = btn("", "wood-btn toggle", () => { settings.onsetStart = !settings.onsetStart; persist(); refresh(); }, "onset");
 const pedalBtn = btn("", "wood-btn toggle", () => { pedalOn = !pedalOn; persist(); refresh(); }, "pedal");
 
@@ -153,7 +159,7 @@ const settingsPanel = h(
   "section",
   { class: "panel settings" },
   h("h2", { class: "engrave" }, "Takt & Ablauf"),
-  h("div", { class: "grid" }, bpmRow, meterSel.el, barsSel.el, tracksSel.el, gapSel.el, countSel.el, clickSel.el),
+  h("div", { class: "grid" }, bpmRow, meterSel.el, defBarsSel.el, tracksSel.el, countSel.el, clickSel.el),
   h("div", { class: "knob-row" }, kClick.el, kDuck.el, kIn.el, kOnset.el),
   h("div", { class: "grid" }, onsetBtn, pedalBtn, pedalSel.el),
   h("h2", { class: "engrave" }, "Latenz-Ausgleich"),
@@ -167,7 +173,7 @@ const kMHall = knob({ label: "Hall", min: 0, max: 1, value: engine.master.hall, 
 const kMEcho = knob({ label: "Echo", min: 0, max: 1, value: engine.master.echo, def: 0.8, format: pct, onInput: (v) => engine.setMaster({ echo: v }) });
 const kMFb = knob({ label: "Echo-Wdh.", min: 0, max: 0.85, value: engine.master.echoFeedback, def: 0.4, format: pct, onInput: (v) => engine.setMaster({ echoFeedback: v }) });
 const echoDiv = select<DelayDiv>("Echo-Zeit", [["1/16", "1/16"], ["1/8", "1/8"], ["1/8.", "1/8 punktiert"], ["1/4", "1/4"]], engine.master.echoDiv, (v) => engine.setMaster({ echoDiv: v }));
-const expSel = select("Export-Länge", [[1, "1× Loop"], [2, "2× Loop"], [4, "4× Loop"], [8, "8× Loop"]] as [number, string][], 2, () => {});
+const expSel = select("Export-Länge", [[1, "1× Gesamtlänge"], [2, "2×"], [4, "4×"], [8, "8×"]] as [number, string][], 2, () => {});
 const exportBtn = btn("WAV exportieren", "wood-btn", () => void exportWav(), "export");
 const saveBtn = btn("Sitzung speichern", "wood-btn", () => void saveNow(), "save");
 const loadBtn = btn("Sitzung laden", "wood-btn", () => void loadNow(), "load");
@@ -191,11 +197,13 @@ interface Strip {
   mute: HTMLButtonElement;
   solo: HTMLButtonElement;
   rev: HTMLButtonElement;
-  re: HTMLButtonElement;
   del: HTMLButtonElement;
   vol: HTMLInputElement;
   knobs: Partial<Record<keyof TrackParams, Knob>>;
   drawn: Float32Array | null;
+  rec: HTMLButtonElement;
+  len: HTMLSelectElement;
+  info: HTMLElement;
 }
 const strips: Strip[] = [];
 function makeStrip(i: number): Strip {
@@ -207,7 +215,15 @@ function makeStrip(i: number): Strip {
   const mute = btn("Stumm", "wood-btn toggle", () => set("mute", !engine.tracks[i].params.mute), `mute-${i}`);
   const solo = btn("Solo", "wood-btn toggle", () => set("solo", !engine.tracks[i].params.solo), `solo-${i}`);
   const rev = btn("Rückwärts", "wood-btn toggle", () => set("reverse", !engine.tracks[i].params.reverse), `rev-${i}`);
-  const re = btn("Neu aufn.", "wood-btn toggle", () => engine.rerecordTrack(i), `re-${i}`);
+  const rec = btn("● REC", "rec-btn", () => void guard(() => engine.toggleRec(i)), `rec-${i}`);
+  const len = h("select", { class: "len-sel", "aria-label": `Länge Spur ${i + 1}`, "data-testid": `len-${i}` });
+  for (const n of BAR_CHOICES) len.append(h("option", { value: String(n) }, `${n} ${n === 1 ? "Takt" : "Takte"}`));
+  len.value = String(engine.tracks[i].bars);
+  len.addEventListener("change", () => {
+    engine.setTrackBars(i, Number(len.value));
+    refresh();
+  });
+  const info = h("span", { class: "len-info", "data-testid": `info-${i}` });
   const del = btn("Löschen", "wood-btn danger", () => engine.deleteTrack(i), `del-${i}`);
   const vol = h("input", { type: "range", min: 0, max: 1.5, step: 0.01, value: p.vol, class: "fader", "aria-label": `Lautstärke Spur ${i + 1}`, "data-testid": `vol-${i}` }) as HTMLInputElement;
   vol.addEventListener("input", () => set("vol", Number(vol.value)));
@@ -218,13 +234,14 @@ function makeStrip(i: number): Strip {
   const el = h(
     "article",
     { class: "track panel", "data-testid": `track-${i}` },
-    h("div", { class: "track-head" }, h("span", { class: "track-name engrave" }, `Spur ${i + 1}`), chip),
+    h("div", { class: "track-head" }, h("span", { class: "track-name engrave" }, `Spur ${i + 1}`), info, chip),
+    h("div", { class: "rec-row" }, rec, h("label", { class: "len-field" }, h("span", { class: "engrave small" }, "Länge"), len)),
     h("div", { class: "wave-box" }, wave, head),
-    h("div", { class: "track-btns" }, mute, solo, rev, re, del),
+    h("div", { class: "track-btns" }, mute, solo, rev, del),
     h("label", { class: "vol-row" }, h("span", { class: "engrave small" }, "Lautstärke"), vol),
     h("div", { class: "knob-row" }, ...Object.values(knobs).map((k) => k.el)),
   );
-  return { el, chip, wave, head, mute, solo, rev, re, del, vol, knobs, drawn: null };
+  return { el, chip, wave, head, mute, solo, rev, del, vol, knobs, drawn: null, rec, len, info };
 }
 
 function drawWave(s: Strip, data: Float32Array | null) {
@@ -269,33 +286,60 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-async function main() {
+async function guard(fn: () => Promise<unknown> | unknown) {
   errBox.textContent = "";
   try {
-    await engine.mainAction();
+    await fn();
     void lockScreen();
   } catch (e) {
     errBox.textContent = engine.micError || (e as Error).message;
   }
 }
+const main = () => guard(() => engine.mainAction());
 
 function pedalB() {
   if (settings.pedalB === "undo") engine.undo();
-  else if (settings.pedalB === "auto") engine.setAutoRecord(!engine.autoRecord);
-  else void main();
+  else if (settings.pedalB === "cancel") {
+    if (engine.rec) void guard(() => engine.toggleRec(engine.rec!.track));
+  } else void main();
 }
 
+// Pedal A: short tap = REC next empty track (or cancel an armed one; Start/Weiter when stopped),
+// hold >= 0.6 s = Stopp. Pedal B (left/up) is configurable.
+const PEDAL_A = [" ", "Enter", "ArrowRight", "ArrowDown", "PageDown", "MediaPlayPause"];
+const PEDAL_B = ["ArrowLeft", "ArrowUp", "PageUp"];
+let pedalDown = 0;
+let pedalHeldFired = false;
+let holdTimer: ReturnType<typeof setTimeout> | null = null;
+const isTyping = (t: EventTarget | null) => t instanceof HTMLInputElement && (t.type === "number" || t.type === "text");
 window.addEventListener(
   "keydown",
   (e) => {
-    if (!pedalOn || e.repeat) return;
-    const tgt = e.target as HTMLElement;
-    if (tgt instanceof HTMLInputElement && (tgt.type === "number" || tgt.type === "text")) return;
-    const a = [" ", "Enter", "ArrowRight", "ArrowDown", "PageDown", "MediaPlayPause"];
-    const b = ["ArrowLeft", "ArrowUp", "PageUp"];
-    if (a.includes(e.key)) void main();
-    else if (b.includes(e.key)) pedalB();
-    else return;
+    if (!pedalOn || isTyping(e.target)) return;
+    if (PEDAL_A.includes(e.key)) {
+      if (!e.repeat && !pedalDown) {
+        pedalDown = performance.now();
+        pedalHeldFired = false;
+        holdTimer = setTimeout(() => {
+          pedalHeldFired = true;
+          if (engine.phase !== "idle" && engine.phase !== "paused") engine.pause();
+        }, 600);
+      }
+    } else if (PEDAL_B.includes(e.key)) {
+      if (!e.repeat) pedalB();
+    } else return;
+    e.preventDefault();
+    e.stopPropagation();
+  },
+  true,
+);
+window.addEventListener(
+  "keyup",
+  (e) => {
+    if (!pedalOn || !PEDAL_A.includes(e.key) || !pedalDown) return;
+    if (holdTimer) clearTimeout(holdTimer);
+    pedalDown = 0;
+    if (!pedalHeldFired) void guard(() => engine.pedalTap());
     e.preventDefault();
     e.stopPropagation();
   },
@@ -354,27 +398,23 @@ async function loadNow() {
 
 function syncControls() {
   meterSel.select.value = settings.meter;
-  barsSel.select.value = String(settings.bars);
+  defBarsSel.select.value = String(settings.defaultBars);
   tracksSel.select.value = String(settings.trackCount);
-  gapSel.select.value = String(settings.gap);
   kMVol.set(engine.master.vol);
   kMHall.set(engine.master.hall);
   kMEcho.set(engine.master.echo);
   kMFb.set(engine.master.echoFeedback);
   echoDiv.select.value = engine.master.echoDiv;
-  strips.forEach((s, i) => {
-    const p = engine.tracks[i].params;
-    s.vol.value = String(p.vol);
-    for (const [k, kn] of Object.entries(s.knobs)) kn!.set(p[k as keyof TrackParams] as number);
-  });
   refresh();
 }
 
+const barsTxt = (n: number) => `${n} ${n === 1 ? "Takt" : "Takte"}`;
+
 // ---------- rendering ----------
 function refresh() {
-  const locked = engine.hasAudio;
+  const locked = engine.gridLocked;
   bpmVal.textContent = String(settings.bpm);
-  for (const el of [bpmMinus, bpmPlus, tapBtn, meterSel.select, barsSel.select]) (el as HTMLButtonElement).disabled = locked;
+  for (const el of [bpmMinus, bpmPlus, tapBtn, meterSel.select]) (el as HTMLButtonElement).disabled = locked;
   bpmRow.title = locked ? "Zum Ändern alle Spuren löschen" : "";
   latRange.value = String(settings.latencyMs);
   latVal.textContent = `${settings.latencyMs.toFixed(0)} ms`;
@@ -382,101 +422,105 @@ function refresh() {
   onsetBtn.classList.toggle("active", settings.onsetStart);
   pedalBtn.textContent = `Fußpedal/Tasten: ${pedalOn ? "an" : "aus"}`;
   pedalBtn.classList.toggle("active", pedalOn);
-  autoBtn.textContent = `Auto-Aufnahme: ${engine.autoRecord ? "an" : "aus"}`;
-  autoBtn.classList.toggle("active", engine.autoRecord);
   undoBtn.disabled = !engine.canUndo();
   clearBtn.disabled = !engine.hasAudio && engine.phase === "idle";
   const ph = engine.phase;
   mainBtn.textContent = ph === "idle" ? "▶ Start" : ph === "paused" ? "▶ Weiter" : "■ Stopp";
   mainBtn.dataset.phase = ph;
+  const v = engine.view();
+  nextBtn.disabled = engine.firstEmpty() < 0 && !engine.rec;
   const visible = Math.max(settings.trackCount, ...engine.tracks.map((t, i) => (t.data ? i + 1 : 0)));
   while (strips.length < engine.tracks.length) {
     const s = makeStrip(strips.length);
     strips.push(s);
     trackList.append(s.el);
   }
-  const v = engine.view();
   strips.forEach((s, i) => {
     const t = engine.tracks[i];
+    const st = v.trackState[i];
     s.el.hidden = i >= visible;
     if (s.drawn !== t.data) drawWave(s, t.data);
     for (const [k, kn] of Object.entries(s.knobs)) kn!.set(t.params[k as keyof TrackParams] as number);
     if (document.activeElement !== s.vol) s.vol.value = String(t.params.vol);
+    if (document.activeElement !== s.len) s.len.value = String(t.bars);
+    s.len.disabled = (!!t.data && st !== "armed") || st === "recording";
     s.mute.classList.toggle("active", t.params.mute);
     s.solo.classList.toggle("active", t.params.solo);
     s.rev.classList.toggle("active", t.params.reverse);
-    s.re.classList.toggle("active", t.rerecord);
-    s.re.disabled = !t.data;
-    s.del.disabled = !t.data && !t.busy;
-    let state = t.data ? (t.params.mute ? "stumm" : "spielt") : "leer";
-    if (t.rerecord) state = "neu: wartet";
-    if (v.nextRecord?.track === i) state = "gleich";
-    if (v.recording === i) state = "Aufnahme";
-    s.chip.textContent = state;
-    s.el.dataset.state = v.recording === i ? "rec" : t.data ? (t.params.mute ? "mute" : "play") : "empty";
+    s.del.disabled = !t.data;
+    s.rec.textContent = st === "armed" ? "✕ Abbrechen" : st === "recording" ? "■ Verwerfen" : t.data ? "● Neu aufn." : "● REC";
+    s.rec.dataset.state = st;
+    const mb = engine.masterBars;
+    const rel = mb && t.bars !== mb ? ` · ${t.bars > mb ? `${t.bars / mb}×` : `1/${mb / t.bars}`} Spur-1-Loop` : "";
+    s.info.textContent = barsTxt(t.data ? t.dataBars : t.bars) + rel;
+    s.chip.textContent = { empty: "leer", armed: "wartet auf Anfang", recording: "Aufnahme", playing: "spielt", muted: "stumm" }[st];
+    s.el.dataset.state = st === "recording" ? "rec" : st === "armed" ? "armed" : st === "playing" ? "play" : st === "muted" ? "mute" : "empty";
   });
   if (engine.micError) errBox.textContent = engine.micError;
+  else if (engine.notice) errBox.textContent = engine.notice;
 }
 engine.onChange = refresh;
 
-let lastBeatKey = "";
+let lastKey = "";
 function frame() {
   const v = engine.view();
   const ph = v.phase;
   let st = "Bereit";
-  let sub = "Einmal Start tippen – oder aufs Pedal treten.";
+  let sub = "Start tippen oder Pedal treten: Einzählen, dann Spur 1 aufnehmen.";
   let mode = "idle";
   let count = "";
-  if (ph === "armed") {
+  let unit = "";
+  if (ph === "waiting") {
     st = "Spiel los!";
-    sub = `Aufnahme Spur ${(v.nextRecord?.track ?? 0) + 1} startet beim ersten Anschlag`;
+    sub = `Spur ${v.armed + 1} startet beim ersten Anschlag`;
     mode = "armed";
   } else if (ph === "paused") {
     st = "Pause";
-    sub = "Weiter tippen: es wird neu eingezählt.";
-  } else if (ph === "countin") {
+    sub = "Weiter tippen (wird neu eingezählt) – oder REC an einer Spur.";
+  } else if ((ph === "countin" || ph === "running") && v.countIn > 0) {
     st = "Einzählen";
-    count = String(v.countInLeft);
-    sub = v.action?.kind === "record" ? `Danach Aufnahme Spur ${v.action.track + 1}` : "Danach spielen die Loops";
+    count = String(v.countIn);
+    unit = v.countIn === 1 ? "Schlag" : "Schläge";
+    sub = v.armed >= 0 ? `Danach Aufnahme Spur ${v.armed + 1} (${barsTxt(engine.tracks[v.armed].bars)})` : "Danach spielen die Loops";
     mode = "count";
-  } else if (ph === "running" && v.beat) {
-    if (v.recording >= 0) {
+  } else if (ph === "running" || ph === "countin") {
+    if (v.recording >= 0 && v.toEnd) {
       st = `Aufnahme Spur ${v.recording + 1}`;
       mode = "rec";
-      sub = `Noch ${engine.s.bars - v.beat.bar + 1} ${engine.s.bars - v.beat.bar + 1 === 1 ? "Takt" : "Takte"}`;
+      count = String(v.toEnd.show);
+      unit = v.toEnd.unit;
+      sub = `noch ${v.toEnd.show} ${v.toEnd.unit}`;
+    } else if (v.armed >= 0 && v.toStart) {
+      st = `REC Spur ${v.armed + 1} ab Anfang`;
+      mode = "soon";
+      count = String(v.toStart.show);
+      unit = v.toStart.unit;
+      sub = `Aufnahme ab Takt 1 – noch ${v.toStart.show} ${v.toStart.unit}`;
     } else {
       st = "Spielt";
       mode = "play";
-      if (v.nextRecord) {
-        const lastBar = v.beat.bar === engine.s.bars && v.nextRecord.inCycles === 1;
-        sub = `Nächste: Spur ${v.nextRecord.track + 1}` + (v.nextRecord.inCycles > 1 ? ` in ${v.nextRecord.inCycles} Runden` : " in der nächsten Runde");
-        if (lastBar) {
-          count = String(engine.meter.beats - v.beat.beat + 1);
-          st = `Gleich Spur ${v.nextRecord.track + 1}`;
-          mode = "soon";
-        }
-      } else sub = engine.autoRecord ? "Alle Spuren aufgenommen" : "Auto-Aufnahme aus";
+      sub = engine.firstEmpty() >= 0 ? `REC an Spur ${engine.firstEmpty() + 1} tippen – Aufnahme beginnt am Anfang` : "Alle Spuren belegt";
     }
   }
   if (stateBig.textContent !== st) stateBig.textContent = st;
   if (stateSub.textContent !== sub) stateSub.textContent = sub;
-  if (countBig.textContent !== count) countBig.textContent = count;
+  if (countNum.textContent !== count) countNum.textContent = count;
+  if (countUnit.textContent !== unit) countUnit.textContent = unit;
   document.body.dataset.mode = mode;
   const beats = engine.meter.beats;
-  if (beatDots.childElementCount !== beats) {
-    beatDots.replaceChildren(...Array.from({ length: beats }, () => h("span", { class: "dot" })));
-  }
-  const key = v.beat ? `${v.beat.cycle}:${v.beat.bar}:${v.beat.beat}` : "";
-  if (key !== lastBeatKey) {
-    lastBeatKey = key;
-    barNum.textContent = v.beat && !v.beat.countIn ? `${v.beat.bar}/${engine.s.bars}` : "–";
-    [...beatDots.children].forEach((d, i) => d.classList.toggle("lit", !!v.beat && v.beat.beat === i + 1));
+  if (beatDots.childElementCount !== beats) beatDots.replaceChildren(...Array.from({ length: beats }, () => h("span", { class: "dot" })));
+  const running = (ph === "running" || ph === "countin") && v.countIn === 0 && v.masterBars > 0;
+  const key = `${ph}:${v.bar}:${v.beat}:${v.countIn}:${v.armed}:${v.recording}`;
+  if (key !== lastKey) {
+    lastKey = key;
+    barNum.textContent = running ? `${v.bar}/${v.masterBars}` : "–";
+    [...beatDots.children].forEach((d, i) => d.classList.toggle("lit", running && v.beat === i + 1));
     refresh();
   }
-  (progress.firstChild as HTMLElement).style.transform = `scaleX(${v.beat && !v.beat.countIn ? v.beat.frac : 0})`;
+  (progress.firstChild as HTMLElement).style.transform = `scaleX(${running ? v.masterFrac : 0})`;
   (meterBar.firstChild as HTMLElement).style.transform = `scaleX(${Math.min(1, v.level)})`;
   meterBar.classList.toggle("clip", v.clip);
-  for (const s of strips) s.head.style.left = v.beat && !v.beat.countIn ? `${v.beat.frac * 100}%` : "0";
+  strips.forEach((s, i) => (s.head.style.left = running ? `${v.trackFrac[i] * 100}%` : "0"));
   requestAnimationFrame(frame);
 }
 

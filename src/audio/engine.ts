@@ -1,20 +1,19 @@
-// Looper engine: master clock, auto-advancing recording, sample-exact loops, effects, metronome.
-import { METERS, accentOf, alignedOffset, barFrames, beatFrames, beatInfo, cycleStart, loopFrames, msToFrames, recordWindow, type BeatInfo } from "../core/timing.ts";
-import { decideCycle, pendingTrack, type CycleAction, type TrackSlot } from "../core/plan.ts";
+// Looper engine: master clock, armed recording that starts exactly at the next loop start ("Anfang"),
+// per-track lengths phase-locked to one bar grid, effects, metronome.
+import { METERS, accentOf, msToFrames } from "../core/timing.ts";
+import { barLength, countdown, lcmBars, nextCycleStart, phaseOf, trackPos, type Countdown } from "../core/grid.ts";
 import { FrameRing } from "../core/ring.ts";
 import { closeLoop, reverse } from "../core/seam.ts";
 import { detectLatency, type LatencyResult } from "../core/latency.ts";
 import { MasterBus, TrackChain, audibleTracks, defaultMasterParams, defaultTrackParams, type MasterParams, type TrackParams } from "./fx.ts";
 
 export type ClickMode = "aus" | "einzaehlen" | "aufnahme" | "immer";
-export type PedalB = "undo" | "auto" | "stop";
+export type PedalB = "undo" | "stop" | "cancel";
 
 export interface Settings {
   bpm: number;
   meter: string;
-  bars: number;
   trackCount: number;
-  gap: number;
   countIn: number;
   click: ClickMode;
   clickVol: number;
@@ -24,14 +23,13 @@ export interface Settings {
   latencyMs: number;
   inputGain: number;
   pedalB: PedalB;
+  defaultBars: number;
 }
 
 export const defaultSettings = (): Settings => ({
   bpm: 90,
   meter: "4/4",
-  bars: 4,
   trackCount: 4,
-  gap: 1,
   countIn: 1,
   click: "aufnahme",
   clickVol: 0.6,
@@ -41,43 +39,63 @@ export const defaultSettings = (): Settings => ({
   latencyMs: 0,
   inputGain: 1,
   pedalB: "undo",
+  defaultBars: 4,
 });
 
-export type Phase = "idle" | "armed" | "countin" | "running" | "paused";
+export const BAR_CHOICES = [1, 2, 4, 8, 16];
+
+export type Phase = "idle" | "waiting" | "countin" | "running" | "paused";
 
 export interface Track {
   index: number;
-  data: Float32Array | null; // forward audio, exactly loopLen frames
+  bars: number; // length for the next recording (and of the current audio)
+  data: Float32Array | null; // forward audio, exactly bars*barF frames
+  dataBars: number;
+  phaseBars: number; // grid offset in bars at which this track's loop begins
   params: TrackParams;
   chain: TrackChain | null;
   source: AudioBufferSourceNode | null;
   srcGain: GainNode | null;
-  rerecord: boolean;
-  busy: boolean;
   takes: number;
 }
 
-interface Pending {
+/** The single armed / recording take. S = output frame where recording starts (a loop start). */
+interface Rec {
   track: number;
-  cycle: number;
-  start: number;
-  end: number;
+  S: number;
+  len: number;
+  bars: number;
 }
+
+interface Pending extends Rec {
+  start: number; // mic frames
+  end: number;
+  phaseBars: number;
+}
+
+export type TrackState = "empty" | "armed" | "recording" | "playing" | "muted";
 
 export interface ViewState {
   phase: Phase;
-  beat: BeatInfo | null;
-  countInLeft: number; // beats left in count-in
-  action: CycleAction | null;
-  recording: number; // track index being recorded now, -1 if none
-  nextRecord: { track: number; inCycles: number } | null;
+  frame: number;
+  bar: number; // 1-based bar in master cycle
+  beat: number; // 1-based beat in bar
+  masterBars: number;
+  masterFrac: number;
+  countIn: number; // beats left in count-in (0 if none)
+  armed: number; // track armed (waiting for the loop start), -1 if none
+  recording: number; // track recording now, -1 if none
+  toStart: Countdown | null; // armed: until recording starts
+  toEnd: Countdown | null; // recording: until the take ends
   level: number;
   clip: boolean;
-  autoRecord: boolean;
+  trackFrac: number[];
+  trackState: TrackState[];
 }
 
 const FADE = 256; // seam crossfade (frames)
 const LOOKAHEAD = 0.25; // s
+const MIN_LEAD = 0.06; // s: an arm closer than this to the loop start waits for the next one
 
 export class Engine {
   s: Settings;
@@ -85,12 +103,14 @@ export class Engine {
   tracks: Track[] = [];
   ctx: AudioContext | null = null;
   phase: Phase = "idle";
-  autoRecord = true;
-  loopLen = 0;
+  barF = 0;
+  masterBars = 0; // 0 = no master cycle yet (defined by the first take)
   t0 = 0;
+  rec: Rec | null = null;
   level = 0;
   clipUntil = 0;
   micError = "";
+  notice = "";
   onChange: () => void = () => {};
   loopbackSeconds: number | null = null; // test mode: output -> delay -> input instead of the microphone
 
@@ -102,13 +122,10 @@ export class Engine {
   private inGain: GainNode | null = null;
   private stream: MediaStream | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
-  private nextCycle = 0;
   private nextBeat = 0;
-  private since = Infinity;
-  private actions = new Map<number, CycleAction>();
   private pending: Pending[] = [];
   private clicks: { osc: OscillatorNode; at: number }[] = [];
-  private history: { track: number; prev: Float32Array | null }[] = [];
+  private history: { track: number; prev: { data: Float32Array; bars: number; phaseBars: number } | null }[] = [];
   private inputReady: Promise<void> | null = null;
 
   constructor(s: Settings) {
@@ -119,21 +136,23 @@ export class Engine {
   get sr(): number {
     return this.ctx?.sampleRate ?? 48000;
   }
-
   get meter() {
     return METERS[this.s.meter] ?? METERS["4/4"];
   }
-
   get hasAudio(): boolean {
     return this.tracks.some((t) => t.data);
   }
-
+  get masterLen(): number {
+    return this.masterBars * this.barF;
+  }
   get latencyFrames(): number {
     return msToFrames(this.s.latencyMs, this.sr);
   }
-
-  computeLoopLen(): number {
-    return loopFrames(this.s.bpm, this.meter.beats, this.s.bars, this.sr);
+  get gridLocked(): boolean {
+    return this.hasAudio || !!this.rec || this.pending.length > 0;
+  }
+  private get playing() {
+    return this.phase === "running" || this.phase === "countin";
   }
 
   setTrackCount(n: number) {
@@ -143,7 +162,22 @@ export class Engine {
   }
 
   private newTrack(index: number): Track {
-    return { index, data: null, params: defaultTrackParams(), chain: null, source: null, srcGain: null, rerecord: false, busy: false, takes: 0 };
+    return { index, bars: this.s.defaultBars, data: null, dataBars: 0, phaseBars: 0, params: defaultTrackParams(), chain: null, source: null, srcGain: null, takes: 0 };
+  }
+
+  setTrackBars(i: number, bars: number) {
+    const t = this.tracks[i];
+    if (t.data && this.rec?.track !== i) return; // locked once recorded; re-arm to change
+    if (this.rec?.track === i && this.playing && this.ctx && this.ctx.currentTime * this.sr >= this.rec.S) return; // already recording
+    t.bars = bars;
+    if (this.rec?.track === i) {
+      // re-plan the armed take with the new length
+      this.rec.bars = bars;
+      this.rec.len = bars * this.barF;
+      if (this.masterBars === 0 || (!this.hasAudio && this.pending.length === 0)) this.masterBars = bars;
+      if (Number.isFinite(this.rec.S)) this.setRec({ ...this.rec });
+    }
+    this.onChange();
   }
 
   async ensureAudio(): Promise<AudioContext> {
@@ -165,10 +199,11 @@ export class Engine {
   }
 
   async ensureInput(): Promise<void> {
-    if (!this.inputReady) this.inputReady = this.openInput().catch((e) => {
-      this.inputReady = null;
-      throw e;
-    });
+    if (!this.inputReady)
+      this.inputReady = this.openInput().catch((e) => {
+        this.inputReady = null;
+        throw e;
+      });
     return this.inputReady;
   }
 
@@ -210,22 +245,14 @@ export class Engine {
     this.ring!.write(frame, data);
     this.level = Math.max(pk, this.level * 0.85);
     if (pk >= 0.98) this.clipUntil = performance.now() + 1200;
-    if (this.phase === "armed" && pk >= this.s.onsetLevel) {
+    if (this.phase === "waiting" && pk >= this.s.onsetLevel) {
       const onset = this.ring!.findOnset(frame, this.s.onsetLevel);
       if (onset >= 0) this.beginAtOnset(onset);
     }
   }
 
-  // ---------- transport ----------
-
-  /** One tap: Start (idle) / Stopp (running) / Weiter (paused). */
-  async mainAction() {
-    if (this.phase === "running" || this.phase === "countin" || this.phase === "armed") this.pause();
-    else await this.start();
-  }
-
-  async start() {
-    const ctx = await this.ensureAudio();
+  private async prepare() {
+    await this.ensureAudio();
     try {
       await this.ensureInput();
     } catch (e) {
@@ -233,72 +260,175 @@ export class Engine {
       this.onChange();
       throw e;
     }
-    if (!this.hasAudio) this.loopLen = this.computeLoopLen();
+    if (!this.gridLocked) this.barF = barLength(this.s.bpm, this.meter.beats, this.sr);
     this.bus!.set(this.master, this.s.bpm);
-    this.resetSchedule();
-    if (this.s.onsetStart && !this.hasAudio) {
-      this.phase = "armed";
-      this.startTimer();
+  }
+
+  private nowFrame(): number {
+    return Math.round(this.ctx!.currentTime * this.sr);
+  }
+
+  // ---------- transport ----------
+
+  /** Big button: Start (idle: count-in + record the first empty track) / Stopp / Weiter. */
+  async mainAction() {
+    if (this.playing || this.phase === "waiting") this.pause();
+    else if (this.phase === "paused") await this.resume();
+    else await this.toggleRec(this.firstEmpty() >= 0 ? this.firstEmpty() : 0);
+  }
+
+  firstEmpty(): number {
+    for (let i = 0; i < this.s.trackCount; i++) if (!this.tracks[i].data) return i;
+    return -1;
+  }
+
+  /** Pedal tap: cancel an armed take, else arm the next empty track (Start/Weiter when stopped). */
+  async pedalTap() {
+    if (this.rec && this.playing && this.nowFrame() < this.rec.S) return this.toggleRec(this.rec.track);
+    if (this.rec) return; // recording: the pedal never destroys a running take
+    if (this.phase === "paused") return this.resume();
+    const i = this.firstEmpty();
+    if (i < 0) {
+      this.notice = "Alle Spuren sind belegt – Spur löschen oder REC an einer Spur tippen.";
       this.onChange();
       return;
     }
-    const now = Math.round(ctx.currentTime * this.sr);
-    const bar = barFrames(this.loopLen, this.s.bars);
-    this.t0 = now + Math.round(this.sr * 0.12 + this.s.countIn * bar);
+    return this.toggleRec(i);
+  }
+
+  /** REC button of a track: arm / cancel arm / abort a running take. */
+  async toggleRec(i: number) {
+    this.notice = "";
+    if (this.rec?.track === i) {
+      this.cancelRec();
+      return;
+    }
+    if (this.rec && this.ctx && this.nowFrame() >= this.rec.S && this.playing) {
+      this.notice = `Spur ${this.rec.track + 1} nimmt gerade auf.`;
+      this.onChange();
+      return;
+    }
+    if (this.rec) this.cancelRec(true);
+    await this.prepare();
+    const t = this.tracks[i];
+    const firstTake = this.masterBars === 0 || (!this.hasAudio && this.pending.length === 0);
+    if (firstTake) this.masterBars = t.bars;
+    const len = t.bars * this.barF;
+    if (this.playing) {
+      const S = nextCycleStart(this.nowFrame(), this.t0, this.masterLen, Math.round(MIN_LEAD * this.sr));
+      this.setRec({ track: i, S, len, bars: t.bars });
+    } else if (firstTake && this.s.onsetStart) {
+      this.rec = { track: i, S: Infinity, len, bars: t.bars };
+      this.phase = "waiting";
+      this.startTimer();
+    } else {
+      this.startClock();
+      this.setRec({ track: i, S: this.t0, len, bars: t.bars });
+    }
+    this.onChange();
+  }
+
+  private setRec(r: Rec) {
+    this.rec = r;
+    const ctx = this.ctx!;
+    const sS = r.S / this.sr;
+    const sE = (r.S + r.len) / this.sr;
+    this.duck!.gain.cancelScheduledValues(ctx.currentTime);
+    this.duck!.gain.setValueAtTime(1, ctx.currentTime);
+    this.duck!.gain.setValueAtTime(this.s.duck, sS);
+    this.duck!.gain.setValueAtTime(1, sE);
+    // a re-recorded track goes silent while the new take is recorded
+    const t = this.tracks[r.track];
+    if (t.srcGain) {
+      t.srcGain.gain.cancelScheduledValues(ctx.currentTime);
+      t.srcGain.gain.setValueAtTime(1, ctx.currentTime);
+      t.srcGain.gain.setValueAtTime(1, sS);
+      t.srcGain.gain.linearRampToValueAtTime(0, sS + 0.01);
+    }
+  }
+
+  private cancelRec(quiet = false) {
+    const r = this.rec;
+    if (!r) return;
+    this.rec = null;
+    if (this.ctx) {
+      const now = this.ctx.currentTime;
+      this.duck!.gain.cancelScheduledValues(now);
+      this.duck!.gain.setValueAtTime(1, now);
+      const t = this.tracks[r.track];
+      if (t.srcGain) {
+        t.srcGain.gain.cancelScheduledValues(now);
+        t.srcGain.gain.setValueAtTime(1, now);
+      }
+    }
+    if (!this.hasAudio && !this.pending.length) {
+      // nothing to play: back to the start screen
+      this.stopTimer();
+      this.stopClicks();
+      this.masterBars = 0;
+      this.phase = "idle";
+    }
+    if (!quiet) this.onChange();
+  }
+
+  /** Starts the grid with a count-in; existing tracks start at t0. */
+  private startClock() {
+    const now = this.nowFrame();
+    this.t0 = now + Math.round(this.sr * 0.12 + this.s.countIn * this.barF);
     this.nextBeat = -this.s.countIn * this.meter.beats;
     for (const t of this.tracks) if (t.data) this.startSource(t, this.t0);
     this.phase = "countin";
     this.startTimer();
+  }
+
+  async resume() {
+    await this.prepare();
+    this.startClock();
     this.onChange();
   }
 
   private beginAtOnset(onset: number) {
+    if (!this.rec) return;
     const pre = msToFrames(15, this.sr);
     this.t0 = onset - pre - this.latencyFrames;
     const now = this.ctx!.currentTime * this.sr;
-    const bf = beatFrames(this.loopLen, this.meter.beats, this.s.bars);
-    this.nextBeat = Math.ceil((now - this.t0) / bf);
+    this.nextBeat = Math.ceil((now - this.t0) / (this.barF / this.meter.beats));
     this.phase = "running";
+    this.setRec({ ...this.rec, S: this.t0 });
     this.onChange();
+  }
+
+  private stopClicks() {
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime;
+    for (const c of this.clicks) if (c.at > now) c.osc.stop();
+    this.clicks = [];
   }
 
   pause() {
     if (!this.ctx) return;
-    const now = this.ctx.currentTime;
-    const nowF = now * this.sr;
     this.stopTimer();
+    if (this.rec) this.cancelRec(true);
     for (const t of this.tracks) this.stopSource(t);
-    for (const c of this.clicks) if (c.at > now) c.osc.stop();
-    this.clicks = [];
-    this.pending = this.pending.filter((p) => p.end - this.latencyFrames <= nowF);
-    for (const t of this.tracks) t.busy = this.pending.some((p) => p.track === t.index);
+    this.stopClicks();
+    const now = this.ctx.currentTime;
     this.duck!.gain.cancelScheduledValues(now);
     this.duck!.gain.setValueAtTime(1, now);
     this.phase = this.hasAudio || this.pending.length ? "paused" : "idle";
-    this.timer = setInterval(() => this.flushPending(), 30); // finish takes that ended before the stop
+    if (this.phase === "idle") this.masterBars = 0;
+    if (this.pending.length) this.timer = setInterval(() => this.flushPending(), 30);
     this.onChange();
   }
 
-  /** Stop everything and wipe all tracks. */
   clearAll() {
     this.pause();
     this.stopTimer();
     this.pending = [];
     for (const t of this.tracks) this.clearTrackAudio(t);
     this.history = [];
+    this.masterBars = 0;
     this.phase = "idle";
     this.onChange();
-  }
-
-  setAutoRecord(on: boolean) {
-    this.autoRecord = on;
-    this.onChange();
-  }
-
-  private resetSchedule() {
-    this.nextCycle = 0;
-    this.since = Infinity;
-    this.actions.clear();
   }
 
   private startTimer() {
@@ -312,41 +442,29 @@ export class Engine {
     this.timer = null;
   }
 
-  private slots(): TrackSlot[] {
-    return this.tracks.map((t) => ({ hasAudio: !!t.data || t.busy, rerecord: t.rerecord && !t.busy }));
-  }
-
   private tick() {
     const ctx = this.ctx!;
+    if (this.phase === "waiting") return;
     const now = ctx.currentTime * this.sr;
-    if (this.phase === "armed") return;
     const horizon = now + LOOKAHEAD * this.sr;
-    // cycle decisions
-    while (cycleStart(this.nextCycle, this.t0, this.loopLen) < horizon) {
-      const c = this.nextCycle++;
-      const a = decideCycle({ slots: this.slots(), trackCount: this.s.trackCount, gap: this.s.gap, autoRecord: this.autoRecord, cyclesSinceRecord: this.since });
-      this.actions.set(c, a);
-      this.actions.delete(c - 4);
-      const startSec = Math.max(ctx.currentTime, cycleStart(c, this.t0, this.loopLen) / this.sr);
-      this.duck!.gain.setValueAtTime(a.kind === "record" ? this.s.duck : 1, startSec);
-      if (a.kind === "record") {
-        const w = recordWindow(c, this.t0, this.loopLen, this.latencyFrames, FADE);
-        this.pending.push({ track: a.track, cycle: c, start: w.start, end: w.end });
-        this.tracks[a.track].busy = true;
-        this.since = 0;
-      } else this.since++;
+    // recording window complete on the output side -> hand over to extraction
+    if (this.rec && now >= this.rec.S + this.rec.len) {
+      const r = this.rec;
+      this.rec = null;
+      const start = r.S + this.latencyFrames;
+      this.pending.push({ ...r, start, end: start + r.len + FADE, phaseBars: Math.round(phaseOf(r.S, this.t0, r.len) / this.barF) });
       this.onChange();
     }
     // metronome
-    const bf = beatFrames(this.loopLen, this.meter.beats, this.s.bars);
-    while (this.t0 + this.nextBeat * bf < horizon) {
+    const beatF = this.barF / this.meter.beats;
+    while (this.t0 + this.nextBeat * beatF < horizon) {
       const n = this.nextBeat++;
-      const at = this.t0 + n * bf;
+      const at = this.t0 + n * beatF;
       if (at < now - 64) continue;
-      const cyc = Math.floor(n / (this.meter.beats * this.s.bars));
-      const act = this.actions.get(cyc);
       const m = this.s.click;
-      const play = m === "immer" || n < 0 || (m === "aufnahme" && act?.kind === "record");
+      const r = this.rec;
+      const recBeat = !!r && at < r.S + r.len - 1;
+      const play = m === "immer" || n < 0 || (m === "aufnahme" && recBeat);
       if (play && m !== "aus") {
         const inBar = ((n % this.meter.beats) + this.meter.beats) % this.meter.beats;
         this.click(at / this.sr, accentOf(inBar, this.meter), n < 0);
@@ -364,35 +482,34 @@ export class Engine {
     const keep: Pending[] = [];
     for (const p of this.pending) {
       if (this.ring.has(p.start, p.end)) this.finishTake(p);
-      else if (p.start < this.ring.start) this.tracks[p.track].busy = false;
+      else if (p.start < this.ring.start) continue;
       else keep.push(p);
     }
     this.pending = keep;
-    if (this.phase === "paused" || this.phase === "idle") {
-      if (!this.pending.length && this.timer) this.stopTimer();
-    }
+    if ((this.phase === "paused" || this.phase === "idle") && !this.pending.length && this.timer) this.stopTimer();
   }
 
   private finishTake(p: Pending) {
-    const raw = this.ring!.read(p.start, this.loopLen + FADE);
-    const data = closeLoop(raw, this.loopLen, FADE);
+    const raw = this.ring!.read(p.start, p.len + FADE);
+    const data = closeLoop(raw, p.len, FADE);
     const t = this.tracks[p.track];
-    this.history.push({ track: t.index, prev: t.rerecord ? t.data : null });
+    this.history.push({ track: t.index, prev: t.data ? { data: t.data, bars: t.dataBars, phaseBars: t.phaseBars } : null });
     t.data = data;
-    t.rerecord = false;
-    t.busy = false;
+    t.dataBars = p.bars;
+    t.bars = p.bars;
+    t.phaseBars = p.phaseBars;
     t.takes++;
-    if (this.phase === "running" || this.phase === "countin") {
-      const startF = Math.max(this.ctx!.currentTime * this.sr + this.sr * 0.03, p.end - FADE - this.latencyFrames);
+    if (this.playing) {
+      const startF = Math.max(this.ctx!.currentTime * this.sr + this.sr * 0.03, p.S + p.len);
       this.startSource(t, startF);
-    }
+    } else if (this.phase === "idle") this.phase = "paused";
     this.onChange();
   }
 
   // ---------- tracks ----------
 
   private bufferFor(t: Track): AudioBuffer {
-    const b = this.ctx!.createBuffer(1, this.loopLen, this.sr);
+    const b = this.ctx!.createBuffer(1, t.data!.length, this.sr);
     b.copyToChannel((t.params.reverse ? reverse(t.data!) : t.data!) as Float32Array<ArrayBuffer>, 0);
     return b;
   }
@@ -407,7 +524,7 @@ export class Engine {
     const g = this.ctx.createGain();
     src.connect(g).connect(t.chain!.input);
     const when = Math.max(this.ctx.currentTime, whenFrame / this.sr);
-    const off = alignedOffset(Math.round(when * this.sr), this.t0, this.loopLen);
+    const off = trackPos(Math.round(when * this.sr), this.t0, t.phaseBars * this.barF, t.data.length);
     src.start(when, off / this.sr);
     t.source = src;
     t.srcGain = g;
@@ -416,15 +533,11 @@ export class Engine {
   private stopSource(t: Track, at?: number) {
     if (!t.source || !this.ctx) return;
     const when = Math.max(this.ctx.currentTime, at ?? 0);
-    t.srcGain!.gain.setValueAtTime(1, when);
+    t.srcGain!.gain.setValueAtTime(t.srcGain!.gain.value, when);
     t.srcGain!.gain.linearRampToValueAtTime(0, when + 0.008);
     t.source.stop(when + 0.01);
     t.source = null;
     t.srcGain = null;
-  }
-
-  private get playing() {
-    return this.phase === "running" || this.phase === "countin";
   }
 
   applyTrack(t: Track, now = false) {
@@ -439,7 +552,7 @@ export class Engine {
     t.params[key] = v;
     if (key === "solo" || key === "mute") for (const x of this.tracks) this.applyTrack(x);
     else this.applyTrack(t);
-    if (key === "reverse" && t.data && this.playing) this.startSource(t, this.ctx!.currentTime * this.sr + 0.02 * this.sr);
+    if (key === "reverse" && t.data && this.playing && this.rec?.track !== i) this.startSource(t, this.ctx!.currentTime * this.sr + 0.02 * this.sr);
     this.onChange();
   }
 
@@ -452,25 +565,29 @@ export class Engine {
   private clearTrackAudio(t: Track) {
     this.stopSource(t);
     t.data = null;
-    t.rerecord = false;
-    t.busy = false;
+    t.dataBars = 0;
+    t.phaseBars = 0;
   }
 
   deleteTrack(i: number) {
     const t = this.tracks[i];
+    if (this.rec?.track === i) this.cancelRec(true);
     this.pending = this.pending.filter((p) => p.track !== i);
     this.history = this.history.filter((h) => h.track !== i);
     this.clearTrackAudio(t);
     t.params = defaultTrackParams();
     this.applyTrack(t);
-    if (!this.hasAudio && this.phase === "paused") this.phase = "idle";
+    this.afterRemoval();
     this.onChange();
   }
 
-  rerecordTrack(i: number) {
-    const t = this.tracks[i];
-    t.rerecord = !t.rerecord;
-    this.onChange();
+  private afterRemoval() {
+    if (this.hasAudio || this.rec || this.pending.length) return;
+    // all empty: the next take defines a new master cycle, tempo is free again
+    this.stopTimer();
+    this.stopClicks();
+    this.masterBars = 0;
+    this.phase = "idle";
   }
 
   canUndo(): boolean {
@@ -482,9 +599,12 @@ export class Engine {
     if (!h) return;
     const t = this.tracks[h.track];
     this.stopSource(t);
-    t.data = h.prev;
+    t.data = h.prev?.data ?? null;
+    t.dataBars = h.prev?.bars ?? 0;
+    if (h.prev) t.bars = h.prev.bars;
+    t.phaseBars = h.prev?.phaseBars ?? 0;
     if (t.data && this.playing) this.startSource(t, this.ctx!.currentTime * this.sr + 0.02 * this.sr);
-    if (!this.hasAudio && this.phase === "paused") this.phase = "idle";
+    this.afterRemoval();
     this.onChange();
   }
 
@@ -541,49 +661,69 @@ export class Engine {
 
   view(): ViewState {
     const ctx = this.ctx;
-    let beat: BeatInfo | null = null;
-    let countInLeft = 0;
-    let action: CycleAction | null = null;
-    let nextRecord: ViewState["nextRecord"] = null;
-    if (ctx && this.loopLen && (this.phase === "running" || this.phase === "countin")) {
-      const lat = (ctx as AudioContext & { outputLatency?: number }).outputLatency ?? 0;
-      const f = (ctx.currentTime - lat) * this.sr;
-      beat = beatInfo(f, this.t0, this.loopLen, this.meter.beats, this.s.bars);
-      if (beat.countIn) {
-        const bf = beatFrames(this.loopLen, this.meter.beats, this.s.bars);
-        countInLeft = Math.ceil((this.t0 - f) / bf);
-      }
-      action = this.actions.get(Math.max(0, beat.cycle)) ?? null;
-      if (beat.countIn) action = this.actions.get(0) ?? null;
-      if (action?.kind === "listen") nextRecord = { track: action.track, inCycles: action.nextRecordIn };
-      else if (action?.kind === "record" || action?.kind === "play") {
-        const nxt = this.actions.get(beat.cycle + 1);
-        if (nxt?.kind === "record") nextRecord = { track: nxt.track, inCycles: 1 };
-      }
-    }
-    if (this.phase === "armed") {
-      const t = pendingTrack(this.slots(), this.s.trackCount);
-      nextRecord = t >= 0 ? { track: t, inCycles: 0 } : null;
-    }
-    return {
+    const v: ViewState = {
       phase: this.phase,
-      beat,
-      countInLeft,
-      action,
-      recording: action?.kind === "record" && beat && !beat.countIn ? action.track : -1,
-      nextRecord,
+      frame: 0,
+      bar: 0,
+      beat: 0,
+      masterBars: this.masterBars,
+      masterFrac: 0,
+      countIn: 0,
+      armed: -1,
+      recording: -1,
+      toStart: null,
+      toEnd: null,
       level: this.level,
       clip: performance.now() < this.clipUntil,
-      autoRecord: this.autoRecord,
+      trackFrac: this.tracks.map(() => 0),
+      trackState: this.tracks.map((t) => (t.data ? (audibleTracks(this.tracks.map((x) => x.params))[t.index] ? "playing" : "muted") : "empty")),
     };
+    if (this.phase === "waiting" && this.rec) {
+      v.armed = this.rec.track;
+      v.trackState[this.rec.track] = "armed";
+    }
+    if (!ctx || !this.barF || !this.playing) return v;
+    const lat = (ctx as AudioContext & { outputLatency?: number }).outputLatency ?? 0;
+    const f = (ctx.currentTime - lat) * this.sr;
+    v.frame = f;
+    const beatF = this.barF / this.meter.beats;
+    if (f < this.t0) v.countIn = Math.ceil((this.t0 - f) / beatF - 1e-9);
+    if (this.masterLen) {
+      const pos = trackPos(f, this.t0, 0, this.masterLen);
+      v.masterFrac = pos / this.masterLen;
+      v.bar = Math.floor(pos / this.barF) + 1;
+      v.beat = Math.floor((pos % this.barF) / beatF) + 1;
+    }
+    this.tracks.forEach((t, i) => {
+      if (t.data && f >= this.t0) v.trackFrac[i] = trackPos(f, this.t0, t.phaseBars * this.barF, t.data.length) / t.data.length;
+    });
+    const r = this.rec ?? this.pending.find((p) => f < p.S + p.len) ?? null;
+    if (r) {
+      if (f < r.S) {
+        v.armed = r.track;
+        v.toStart = countdown(f, r.S, this.barF, this.meter.beats);
+        v.trackState[r.track] = "armed";
+      } else if (f < r.S + r.len) {
+        v.recording = r.track;
+        v.toEnd = countdown(f, r.S + r.len, this.barF, this.meter.beats);
+        v.trackState[r.track] = "recording";
+        v.trackFrac[r.track] = (f - r.S) / r.len;
+      }
+    }
+    return v;
   }
 
   // ---------- export / session ----------
 
-  async renderMix(cycles: number): Promise<{ channels: Float32Array[]; sampleRate: number }> {
+  exportBars(): number {
+    return lcmBars(this.tracks.filter((t) => t.data).map((t) => t.dataBars));
+  }
+
+  async renderMix(mult: number): Promise<{ channels: Float32Array[]; sampleRate: number; bars: number }> {
     const sr = this.sr;
-    const L = this.loopLen;
-    const off = new OfflineAudioContext(2, L * (cycles + 1), sr);
+    const bars = this.exportBars();
+    const total = bars * this.barF;
+    const off = new OfflineAudioContext(2, total * (mult + 1), sr);
     const bus = new MasterBus(off, this.master, this.s.bpm);
     bus.out.connect(off.destination);
     const aud = audibleTracks(this.tracks.map((x) => x.params));
@@ -591,27 +731,27 @@ export class Engine {
       if (!t.data) continue;
       const ch = new TrackChain(off, bus);
       ch.set(t.params, this.s.bpm, aud[t.index], true);
-      const b = off.createBuffer(1, L, sr);
+      const b = off.createBuffer(1, t.data.length, sr);
       b.copyToChannel((t.params.reverse ? reverse(t.data) : t.data) as Float32Array<ArrayBuffer>, 0);
       const src = off.createBufferSource();
       src.buffer = b;
       src.loop = true;
       src.connect(ch.input);
-      src.start(0);
+      // render frame `total` = grid position 0 (first block is pre-roll so tails wrap in)
+      src.start(0, trackPos(-total, 0, t.phaseBars * this.barF, t.data.length) / sr);
     }
     const out = await off.startRendering();
-    // first cycle is pre-roll so reverb/echo tails wrap into the exported loop
-    return { channels: [out.getChannelData(0).slice(L), out.getChannelData(1).slice(L)], sampleRate: sr };
+    return { channels: [out.getChannelData(0).slice(total), out.getChannelData(1).slice(total)], sampleRate: sr, bars: bars * mult };
   }
 
   snapshot() {
     return {
-      v: 1,
+      v: 2,
       settings: { ...this.s },
       master: { ...this.master },
       sampleRate: this.sr,
-      loopLen: this.loopLen,
-      tracks: this.tracks.map((t) => ({ data: t.data, params: { ...t.params } })),
+      masterBars: this.masterBars,
+      tracks: this.tracks.map((t) => ({ data: t.data, bars: t.bars, dataBars: t.dataBars, phaseBars: t.phaseBars, params: { ...t.params } })),
     };
   }
 
@@ -621,16 +761,21 @@ export class Engine {
     Object.assign(this.s, snap.settings);
     Object.assign(this.master, snap.master);
     this.setTrackCount(Math.max(this.s.trackCount, snap.tracks.length));
-    this.loopLen = this.computeLoopLen();
+    this.barF = barLength(this.s.bpm, this.meter.beats, ctx.sampleRate);
+    this.masterBars = snap.masterBars;
     for (let i = 0; i < snap.tracks.length; i++) {
       const st = snap.tracks[i];
       const t = this.tracks[i];
       t.params = { ...defaultTrackParams(), ...st.params };
-      t.data = st.data ? await resampleTo(st.data, snap.sampleRate, ctx.sampleRate, this.loopLen) : null;
+      t.bars = st.bars;
+      t.dataBars = st.dataBars;
+      t.phaseBars = st.phaseBars;
+      t.data = st.data ? await resampleTo(st.data, snap.sampleRate, ctx.sampleRate, st.dataBars * this.barF) : null;
       this.applyTrack(t, true);
     }
     this.bus!.set(this.master, this.s.bpm, true);
     this.phase = this.hasAudio ? "paused" : "idle";
+    if (!this.hasAudio) this.masterBars = 0;
     this.onChange();
   }
 }
