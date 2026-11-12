@@ -1,7 +1,7 @@
 // Offline shell: caches the app on install (network-first for pages, cache-first for assets).
 const PREFIX = `loopstep:${self.registration.scope}:`;
-const CACHE = `${PREFIX}2f2336cb53f4`;
-const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./recorder-worklet.js", "./assets/index-B3NR1VQw.css", "./assets/index-Fchq5ik4.js"];
+const CACHE = `${PREFIX}209ed615c6fb`;
+const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./recorder-worklet.js", "./assets/index-D8VBFvw8.css", "./assets/index-dxsUhBnq.js"];
 self.addEventListener("install", (event) => {
   event.waitUntil(
     (async () => {
